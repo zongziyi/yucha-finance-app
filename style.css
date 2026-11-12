@@ -442,6 +442,8 @@ svg { display: block; }
 }
 .gauge-divider { height: 1px; background: var(--ink-100); margin: 3px 0; }
 .gauge-row.highlight .gauge-label { color: var(--ink-900); font-weight: 500; }
+/* 超额态：主数值行标签同步转危险色，与数值颜色一致 */
+.gauge-row.highlight.over .gauge-label { color: var(--danger); }
 .gauge-value.big { font-size: 23px; font-weight: 700; letter-spacing: -.5px; }
 .gauge-state {
   align-self: flex-start; margin-top: 5px;
@@ -558,6 +560,7 @@ svg { display: block; }
 }
 
 .form-field { display: flex; flex-direction: column; gap: 8px; }
+#editTxMealField[hidden] { display: none; }
 .form-field > .field-label {
   display: flex; align-items: center; gap: 6px;
   font-size: var(--fs-xs); font-weight: 600; color: var(--ink-500);
@@ -590,6 +593,10 @@ svg { display: block; }
 .date-field { position: relative; display: flex; align-items: center; }
 .date-field .icon { position: absolute; right: 12px; width: 16px; height: 16px; color: var(--ink-400); pointer-events: none; }
 .date-field input { padding-right: 38px; }
+.entry-date-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.entry-date-head .field-label { display: inline-flex; align-items: center; gap: 6px; }
+.entry-date-head .field-label .icon { width: 14px; height: 14px; color: var(--ink-300); }
+.entry-date-hint { color: var(--brand-700); font-size: var(--fs-sm); }
 
 /* ===================== 10. 分类选择器（图标网格）===================== */
 .cat-picker {
@@ -682,6 +689,10 @@ select.f-category.fallback-native {
 .list-summary b { color: var(--ink-900); font-variant-numeric: tabular-nums; font-weight: 640; }
 .list-summary b.income { color: var(--income); }
 
+.bill-filters { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+.bill-filters input { flex: 2 1 200px; min-width: 0; }
+.bill-filters select { flex: 1 1 110px; min-width: 0; }
+.bill-filter-hint { margin: var(--sp-2) 0; font-size: var(--fs-micro); color: var(--ink-400); }
 .bill-list { display: flex; flex-direction: column; }
 .bill-item {
   display: flex; align-items: center; gap: var(--sp-3);
@@ -1055,6 +1066,8 @@ select.f-category.fallback-native {
 @media (max-width: 560px) {
   .page-head { flex-direction: column; align-items: flex-start; gap: var(--sp-3); }
   .head-actions { width: 100%; }
+  .bill-item:has(.bill-actions) { flex-wrap: wrap; margin: 0; }
+  .bill-actions { width: 100%; justify-content: flex-end; flex-wrap: wrap; }
   .bill-remark { max-width: 180px; }
   .cat-picker { grid-template-columns: repeat(4, 1fr); }
   .card { padding: var(--sp-4); border-radius: var(--r-md); }
@@ -1156,8 +1169,18 @@ select.f-category.fallback-native {
   font-variant-numeric: tabular-nums;
 }
 .msum-rows { margin-top: var(--sp-1); }
-.msum-row { gap: var(--sp-2); }
+.msum-row {
+  gap: var(--sp-2); width: 100%; margin: 0; border: 0;
+  background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.msum-row[aria-expanded="true"] { background: var(--surface-2); }
+.msum-row:focus-visible { outline: 2px solid var(--brand-500); outline-offset: 2px; }
+.msum-row > .icon { width: 15px; height: 15px; flex-shrink: 0; color: var(--ink-400); }
 .msum-row .rank-amt { width: 84px; }
+.msum-category-bills { padding: var(--sp-3) 10px; }
+.msum-category-head { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; font-size: var(--fs-sm); color: var(--ink-500); }
+.msum-category-head strong { color: var(--ink-900); }
+.msum-category-bills .bill-remark { white-space: pre-wrap; overflow-wrap: anywhere; max-width: none; }
 
 /* 环比 delta（国内习惯：涨红跌绿） */
 .msum-delta {
@@ -1219,6 +1242,8 @@ select.f-category.fallback-native {
 @media (max-width: 560px) {
   .month-grid { grid-template-columns: repeat(4, 1fr); }
   .msum-row .rank-amt { width: 70px; }
+  .msum-row .rank-track { flex: 1; min-width: 12px; width: auto; }
+  .msum-row .rank-name { flex: 0 0 auto; }
   .msum-delta { width: 88px; }
   .msum-chart { height: 130px; gap: var(--sp-1); }
   .msum-col-x { font-size: 10px; }

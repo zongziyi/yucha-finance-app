@@ -103,13 +103,13 @@ const WORD_MAX_LEN = 40;
 const MEANING_MAX_LEN = 60;
 
 /* 账户顺序：微信 → 支付宝 → 银行（微信为默认付款方式）
-   微信在金库中拆分为「零钱 / 零钱通」；记账扣款默认走「零钱」。 */
+   微信在金库中拆分为「零钱 / 零钱通」；记账默认走「零钱通」，零钱只保留余额展示。 */
 const ACCOUNTS = {
   wechat: {
     name: '微信', icon: 'message-square-text',
     subAccounts: [
-      { key: 'wechat_change', name: '零钱', icon: 'coins', isDefault: true },
-      { key: 'wechat_lct', name: '零钱通', icon: 'piggy-bank' },
+      { key: 'wechat_change', name: '零钱', icon: 'coins' },
+      { key: 'wechat_lct', name: '零钱通', icon: 'piggy-bank', isDefault: true },
     ],
   },
   alipay: { name: '支付宝', icon: 'smartphone' },
@@ -125,10 +125,22 @@ const VAULT_META = {
   alipay: { name: '支付宝', icon: 'smartphone' },
   bank: { name: '银行', icon: 'landmark' },
 };
-/* 交易里的 account → 金库扣减键（微信默认扣「零钱」） */
-const ACCOUNT_TO_VAULT_KEY = { wechat: 'wechat_change', alipay: 'alipay', bank: 'bank' };
+/* 交易里的 account → 金库扣减键（微信默认扣「零钱通」） */
+const ACCOUNT_TO_VAULT_KEY = { wechat: 'wechat_lct', alipay: 'alipay', bank: 'bank' };
 function vaultKeyOf(account) {
   return ACCOUNT_TO_VAULT_KEY[account] || account;
+}
+
+/* 默认扣款改到零钱通之前的微信交易，当时扣的都是「零钱」。
+   这些记录没有 vaultKey 字段，回滚时必须按当时的事实退零钱，不能跟着新默认走。 */
+const LEGACY_WECHAT_VAULT_KEY = 'wechat_change';
+
+/** 该笔交易当初实际动过的金库键。
+ *  新记录带 vaultKey；历史微信记录没有该字段，按当时事实退「零钱」。 */
+function vaultKeyOfTx(tx) {
+  const k = tx && tx.vaultKey;
+  if (k && VAULT_KEYS.indexOf(k) >= 0) return k;
+  return (tx && tx.account === 'wechat') ? LEGACY_WECHAT_VAULT_KEY : vaultKeyOf(tx && tx.account);
 }
 
 /* ---------------------- 工具函数 ---------------------- */
@@ -513,6 +525,9 @@ const Store = {
       t.category = t.type === 'expense' ? normalizeCategory(t.category || '其它') : '';
       t.meal = t.type === 'expense' ? mealForCategory(t.category, t.meal) : '';
       t.counted = t.counted !== false;   // 默认计入环形图
+      // 金库键兜底：非法值清空，让回滚走账户默认池
+      // （adjustVault 对非法 key 是静默 return，脏数据会导致「账删了、钱没退」）
+      if (t.vaultKey !== undefined && VAULT_KEYS.indexOf(t.vaultKey) < 0) delete t.vaultKey;
       t.remark = typeof t.remark === 'string' ? t.remark : '';
       t.createdAt = Number(t.createdAt) || Date.parse(t.date) || Date.now();
       if (!t.id) t.id = uid();
@@ -606,7 +621,7 @@ const Store = {
   getVault() { return this.data.vault; },
 
   /** 调整金库余额。key 可以是「金库键」（wechat_change / wechat_lct / alipay / bank），
-   *  也可以是交易账户键（wechat → 默认落到零钱）。 */
+   *  也可以是交易账户键（wechat → 默认落到零钱通）。 */
   adjustVault(key, delta) {
     const vaultKey = vaultKeyOf(key);
     if (!Object.prototype.hasOwnProperty.call(this.data.vault, vaultKey)) return;
@@ -775,9 +790,13 @@ const state = {
   entryType: 'expense',
   account: 'wechat',
   ledgerMonth: monthStr(),
+  billQuery: '',
+  billCategory: '',
+  billScope: 'all',
   statsDate: todayStr(),
   summaryYear: new Date().getFullYear(), // 月度总结浏览年份（动态当年）
   summaryMonth: monthStr(),              // 月度总结选中月份 'YYYY-MM'
+  summaryCategory: null,                 // 当前展开的支出分类
   // 观影页 UI 状态（切页不重置，保持用户筛选）
   showStatus: 'all',                     // all | want | watching | watched | paused
   showQuery: '',
@@ -2477,8 +2496,15 @@ function renderGauge() {
   const spent = round2(countedExpenses.reduce((s, t) => s + t.amount, 0));
   const limit = Store.getLimit(month);
   const remain = round2(limit - spent);
+
+  /* 超额判据统一为「上限 - 已花」为负：limit = 0 时只要有支出也算超额
+     （旧实现按 ratio > 1 判色、按 remain < 0 判数值，两者会打架） */
+  const over = remain < 0;
+  const overAmount = Math.abs(remain);
   const ratio = limit > 0 ? spent / limit : (spent > 0 ? 1 : 0);
   const pct = Math.round(ratio * 100);
+  const pctText = (limit > 0 || spent === 0) ? pct + '%' : '100%+';
+  const overPct = pct - 100; // 超出上限的百分比，仅 limit > 0 时有意义
 
   // 环形填充
   const fill = $('#gaugeFill');
@@ -2487,22 +2513,37 @@ function renderGauge() {
 
   // 颜色分级
   let color = 'var(--brand-500)', cls = '', label = '正常';
-  if (ratio > 1) { color = 'var(--danger)'; cls = 'danger'; label = '已超额支出'; }
-  else if (ratio >= 0.7) { color = 'var(--warn)'; cls = 'warn'; label = '接近上限，注意控制'; }
+  if (over) {
+    color = 'var(--danger)'; cls = 'danger';
+    label = limit > 0 ? `已超上限 ${overPct}%` : '已超上限';
+  } else if (ratio >= 0.7) {
+    color = 'var(--warn)'; cls = 'warn'; label = '接近上限，注意控制';
+  }
   fill.style.stroke = color;
 
   const pctEl = $('#gaugePct');
-  pctEl.textContent = pct + '%';
+  pctEl.textContent = pctText;
   pctEl.style.color = color;
 
   $('#gaugeSpent').textContent = money(spent);
   $('#gaugeLimit').textContent = money(limit);
-  $('#gaugeRemain').textContent = (remain >= 0 ? '' : '-') + money(Math.abs(remain));
-  $('#gaugeRemain').style.color = remain < 0 ? 'var(--danger)' : 'var(--brand-700)';
   $('#gaugeSub').textContent = isCurrent ? '本月已花 / 上限' : `${month} 已花 / 上限`;
 
-  // 剩余每日平均花费上限 = 剩余可支配 / 本月剩余天数（含当天）
-  renderGaugeDaily(month, remain, isCurrent);
+  /* 主数值行：未超额说「剩余可支配」，超额改说「已超额」，金额一律不带负号 */
+  const remainLabel = $('#gaugeRemainLabel');
+  const remainRow = $('#gaugeRemainRow');
+  const remainEl = $('#gaugeRemain');
+  if (remainLabel) remainLabel.textContent = over ? '本月已超额' : '本月剩余可支配';
+  if (remainRow) remainRow.classList.toggle('over', over);
+  remainEl.textContent = money(overAmount);
+  remainEl.style.color = over ? 'var(--danger)' : 'var(--brand-700)';
+
+  /* 日均行 = 剩余可支配 ÷ 剩余天数。超额或已无剩余天数时该数没有意义，整行隐藏。
+     注意必须用内联 style.display：.gauge-row 是作者样式 display:flex，会盖掉 [hidden] */
+  const remainDays = remainDaysOf(month);
+  const dailyRow = $('#gaugeDailyRow');
+  if (dailyRow) dailyRow.style.display = (over || remainDays <= 0) ? 'none' : '';
+  if (!over && remainDays > 0) renderGaugeDaily(remain, remainDays);
 
   const st = $('#gaugeState');
   st.className = 'gauge-state ' + cls;
@@ -2517,51 +2558,39 @@ function renderGauge() {
     ovE.textContent = money(rawExpense);
     $('#ovIncome').textContent = money(income);
     const ovR = $('#ovRemain');
-    ovR.textContent = (remain >= 0 ? '' : '-') + money(Math.abs(remain));
-    ovR.style.color = remain < 0 ? 'var(--danger)' : 'var(--ink-900)';
+    ovR.textContent = money(overAmount);
+    ovR.style.color = over ? 'var(--danger)' : 'var(--ink-900)';
+    const ovHead = $('#ovRemainHead');
+    if (ovHead) ovHead.textContent = over ? '超出预算' : '剩余预算';
     $('#ovExpenseFoot').textContent = rawExpense > spent
       ? `含未计入 ${money(rawExpense - spent)}`
       : '计入预算的支出';
     $('#ovIncomeFoot').textContent = income > 0 ? '已入账收入' : '本月暂无收入';
-    $('#ovRemainFoot').textContent = remain >= 0 ? '本月可用' : '已超额';
+    $('#ovRemainFoot').textContent = over
+      ? (limit > 0 ? `已超上限 ${overPct}%` : '已超出上限')
+      : '本月可用';
   }
   const sub = $('#ledgerSub');
   if (sub) sub.textContent = `掌握 ${month} 每一笔收支`;
 }
 
-/** 计算并展示每日平均花费上限 */
-function renderGaugeDaily(month, remain, isCurrent) {
-  const el = $('#gaugeDaily');
-  if (!el) return;
-
-  // 剩余天数：当前月按「含今天」计算；历史月份按整月天数；未来月份按整月天数
+/** 该月剩余天数：历史月 0（不再分配）；当月含今天；未来月整月 */
+function remainDaysOf(month) {
   const [y, m] = month.split('-').map(Number);
   const daysInMonth = new Date(y, m, 0).getDate();
-  const now = new Date();
+  const cur = monthStr();
+  if (month < cur) return 0;
+  if (month === cur) return daysInMonth - new Date().getDate() + 1;
+  return daysInMonth;
+}
 
-  let remainDays;
-  if (month < monthStr()) {
-    remainDays = 0;               // 已过去的月份，不再分配
-  } else if (month === monthStr()) {
-    remainDays = daysInMonth - now.getDate() + 1;   // 含今天
-  } else {
-    remainDays = daysInMonth;     // 未来月份，整月可用
-  }
-
-  if (remainDays <= 0) {
-    // 历史月份：不再有可分配额度
-    el.textContent = money(0);
-    el.style.color = 'var(--ink-400)';
-    el.title = '该月份已结束';
-    return;
-  }
-
-  const daily = remain / remainDays;
-  el.textContent = (daily < 0 ? '-' : '') + money(Math.abs(daily));
-  el.style.color = daily < 0 ? 'var(--danger)' : 'var(--ink-900)';
-  el.title = remain >= 0
-    ? `剩余 ${money(remain)} ÷ 剩余 ${remainDays} 天`
-    : `已超额 ${money(Math.abs(remain))}，本月已无额度可分配`;
+/** 展示剩余日均可用额度（仅在「未超额且仍有剩余天数」时调用，故必为正数） */
+function renderGaugeDaily(remain, remainDays) {
+  const el = $('#gaugeDaily');
+  if (!el) return;
+  el.textContent = money(remain / remainDays);
+  el.style.color = 'var(--ink-900)';
+  el.title = `剩余 ${money(remain)} ÷ 剩余 ${remainDays} 天`;
 }
 
 /* --- 分类选择器（图标网格 + 隐藏原生 select 同步）+ 吃饭餐次子选择 --- */
@@ -2692,6 +2721,42 @@ function initEntryForms() {
     const amountWrap = form.querySelector('[data-amount-wrap]');
     const amountInput = form.querySelector('.f-amount');
     amountInput.addEventListener('input', () => amountWrap && amountWrap.classList.remove('invalid'));
+    const dateInput = form.querySelector('.f-date');
+    const dateHint = form.querySelector('[data-entry-date-hint]');
+    const todayButton = form.querySelector('[data-entry-today]');
+    let followsToday = true;
+    let dateTimer;
+    const refreshEntryDate = () => {
+      const today = todayStr();
+      if (followsToday) dateInput.value = today;
+      if (!dateHint) return;
+      const selected = dateInput.value;
+      dateHint.hidden = !selected || selected === today;
+      if (!dateHint.hidden) {
+        const now = new Date();
+        const yesterday = todayStr(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1));
+        dateHint.textContent = `当前记账日期：${selected === yesterday ? '昨天（' + selected + '）' : selected}`;
+      } else dateHint.textContent = '';
+    };
+    const scheduleEntryDateCheck = () => {
+      clearTimeout(dateTimer);
+      const now = new Date();
+      const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+      dateTimer = setTimeout(() => { refreshEntryDate(); scheduleEntryDateCheck(); }, tomorrow - now + 100);
+    };
+    dateInput.addEventListener('change', () => {
+      followsToday = !dateInput.value || dateInput.value === todayStr();
+      if (dateInput.value) refreshEntryDate();
+      else if (dateHint) { dateHint.hidden = true; dateHint.textContent = ''; }
+    });
+    if (todayButton) todayButton.addEventListener('click', () => {
+      followsToday = true;
+      refreshEntryDate();
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) { refreshEntryDate(); scheduleEntryDateCheck(); }
+    });
+    scheduleEntryDateCheck();
 
     // 提交
     form.addEventListener('submit', (e) => {
@@ -2714,7 +2779,9 @@ function initEntryForms() {
       const type = form.dataset.type || 'expense';
       const isExpense = type === 'expense';
       const account = accountOf();
-      const date = form.querySelector('.f-date').value || todayStr();
+      if (!dateInput.value) followsToday = true;
+      refreshEntryDate();
+      const date = dateInput.value || todayStr();
       const catVal = form.querySelector('.f-category').value;
       const mealEl = form.querySelector('.f-meal');
 
@@ -2726,6 +2793,8 @@ function initEntryForms() {
         // 餐次只在「支出 + 吃饭」时才有意义，其余一律留空
         meal: isExpense && catVal === MEAL_PARENT && mealEl ? mealEl.value : '',
         account,
+        // 这笔实际动的金库键，供删除 / 改账户时按当初的池回滚
+        vaultKey: vaultKeyOf(account),
         remark: form.querySelector('.f-remark').value.trim(),
         date,
         counted: true,               // 是否计入当月环形图（默认计入）
@@ -2743,8 +2812,8 @@ function initEntryForms() {
       refreshIcons(btn);
 
       Store.addTransaction(tx);
-      // 联动金库：支出扣款，收入入账
-      Store.adjustVault(account, isExpense ? -tx.amount : tx.amount);
+      // 联动金库：支出扣款，收入入账（按本笔记录的金库键落账）
+      Store.adjustVault(tx.vaultKey, isExpense ? -tx.amount : tx.amount);
 
       // 若记录日期所在月份非当前查看月份，自动跳转
       const txMonth = monthOf(date);
@@ -2756,7 +2825,7 @@ function initEntryForms() {
       // 表单重置（分类按既有行为「粘性」保留；餐次每笔归零，需重新选）
       amountInput.value = '';
       form.querySelector('.f-remark').value = '';
-      form.querySelector('.f-date').value = todayStr();
+      refreshEntryDate();
       if (mealEl) {
         mealEl.value = '';
         const mp = form.querySelector('[data-meal-picker]');
@@ -2783,7 +2852,7 @@ function initEntryForms() {
 
     // 默认状态
     applyEntryType(form, 'expense');
-    form.querySelector('.f-date').value = todayStr();
+    refreshEntryDate();
   });
 }
 
@@ -2839,6 +2908,8 @@ function billRow(t, opts) {
         ${icon('arrow-left-right')}改账户</button>`);
   }
   if (o.interactive) {
+    actions.push(`<button class="btn-mini" data-act="edit" title="编辑这笔记录">
+        ${icon('pencil')}编辑</button>`);
     actions.push(`<button class="btn-mini del" data-act="del" title="删除这笔记录">
         ${icon('trash-2')}删除</button>`);
   }
@@ -2865,17 +2936,25 @@ function billRow(t, opts) {
 /* --- 账单列表 --- */
 function renderBillList(month) {
   const list = $('#billList');
-  const txs = Store.getTransactions(month);
+  const query = state.billQuery.trim().toLocaleLowerCase();
+  const filtering = !!query || !!state.billCategory;
+  const base = filtering && state.billScope === 'all'
+    ? Store.data.transactions.slice().sort((a, b) => (b.date + String(b.createdAt)).localeCompare(a.date + String(a.createdAt)))
+    : Store.getTransactions(month);
+  const txs = filtering ? base.filter((t) =>
+    (!query || (t.remark || '').toLocaleLowerCase().includes(query)) &&
+    (!state.billCategory || (t.type === 'expense' && normalizeCategory(t.category) === state.billCategory))
+  ) : base;
 
   const expense = round2(txs.filter((t) => t.type === 'expense').reduce((s, t) => s + t.amount, 0));
   const income = round2(txs.filter((t) => t.type === 'income').reduce((s, t) => s + t.amount, 0));
   const countedExpense = round2(txs.filter((t) => t.type === 'expense' && isCounted(t)).reduce((s, t) => s + t.amount, 0));
   const excludedExpense = round2(expense - countedExpense);
   $('#listSummary').innerHTML = txs.length
-    ? `<span>共 <b>${txs.length}</b> 笔</span>
+    ? `<span>${filtering ? '筛选结果 · ' : ''}共 <b>${txs.length}</b> 笔</span>
        <span>支出 <b>${money(expense)}</b></span>
-       <span>计入环形图 <b>${money(countedExpense)}</b></span>
-       ${excludedExpense > 0 ? `<span>不计入 <b>${money(excludedExpense)}</b></span>` : ''}
+       ${filtering ? '' : `<span>计入环形图 <b>${money(countedExpense)}</b></span>
+       ${excludedExpense > 0 ? `<span>不计入 <b>${money(excludedExpense)}</b></span>` : ''}`}
        <span>收入 <b class="income">${money(income)}</b></span>
        <span>结余 <b>${money(income - expense)}</b></span>`
     : '';
@@ -2884,8 +2963,8 @@ function renderBillList(month) {
     list.innerHTML = `
       <li class="empty">
         <span class="empty-icon">${icon('notebook-pen')}</span>
-        <span class="empty-title">本月暂无记录</span>
-        <span class="empty-desc">在上方表单记一笔，账单会实时出现在这里</span>
+        <span class="empty-title">${filtering ? '没有找到符合条件的账单' : '本月暂无记录'}</span>
+        <span class="empty-desc">${filtering ? '试试其他关键词、分类或搜索范围' : '在上方表单记一笔，账单会实时出现在这里'}</span>
       </li>`;
     refreshIcons(list);
     return;
@@ -2895,15 +2974,109 @@ function renderBillList(month) {
   refreshIcons(list);
 }
 
+const billCategoryFilter = $('#billCategoryFilter');
+billCategoryFilter.innerHTML += CATEGORIES.map((cat) => `<option value="${escapeHtml(cat)}">${escapeHtml(cat)}</option>`).join('');
+$('#billSearch').addEventListener('input', (e) => { state.billQuery = e.target.value; renderBillList(state.ledgerMonth); });
+billCategoryFilter.addEventListener('change', (e) => { state.billCategory = e.target.value; renderBillList(state.ledgerMonth); });
+$('#billSearchScope').addEventListener('change', (e) => { state.billScope = e.target.value; renderBillList(state.ledgerMonth); });
+
 /* --- 账单操作（事件委托） --- */
 $('#billList').addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-act]');
   if (!btn) return;
   const id = btn.closest('.bill-item').dataset.id;
   if (btn.dataset.act === 'del') confirmDelete(id);
+  if (btn.dataset.act === 'edit') openEditTransaction(id);
   if (btn.dataset.act === 'account') openChangeAccount(id);
   if (btn.dataset.act === 'toggle-count') toggleCounted(id);
 });
+
+/** 编辑交易：一次性保存交易与金库，失败时保留原有数据。 */
+function openEditTransaction(id) {
+  const tx = Store.data.transactions.find((t) => t.id === id);
+  if (!tx) return;
+  const isExpense = tx.type === 'expense';
+  const category = normalizeCategory(tx.category);
+  const categories = CATEGORIES.includes(category) ? CATEGORIES : [category, ...CATEGORIES];
+  const options = (values, selected) => values.map(([value, label]) =>
+    `<option value="${escapeHtml(value)}"${value === selected ? ' selected' : ''}>${escapeHtml(label)}</option>`).join('');
+  openModal(`
+    <h3>${icon('pencil')}编辑${isExpense ? '支出' : '收入'}</h3>
+    <div class="form-field"><label class="field-label" for="editTxAmount">金额</label>
+      <input class="input" id="editTxAmount" type="number" min="0.01" step="0.01" value="${escapeHtml(tx.amount)}" /></div>
+    ${isExpense ? `<div class="form-field"><label class="field-label" for="editTxCategory">分类</label>
+      <select class="input" id="editTxCategory">${options(categories.map((c) => [c, c]), category)}</select></div>
+    <div class="form-field" id="editTxMealField"><label class="field-label" for="editTxMeal">餐次（选填）</label>
+      <select class="input" id="editTxMeal">${options([['', '不选择'], ...MEALS.map((m) => [m, m])], normalizeMeal(tx.meal))}</select></div>` : ''}
+    <div class="form-field"><label class="field-label" for="editTxAccount">${isExpense ? '扣款账户' : '收入账户'}</label>
+      <select class="input" id="editTxAccount">${options(Object.entries(ACCOUNTS).map(([key, info]) => [key, info.name]), tx.account)}</select></div>
+    <div class="form-field"><label class="field-label" for="editTxDate">日期</label>
+      <input class="input" id="editTxDate" type="date" value="${escapeHtml(dateOf(tx.date))}" /></div>
+    <div class="form-field"><label class="field-label" for="editTxRemark">备注（选填）</label>
+      <input class="input" id="editTxRemark" type="text" value="${escapeHtml(tx.remark || '')}" /></div>
+    <div class="modal-actions"><button type="button" class="btn btn-ghost" id="modalCancel">取消</button>
+      <button type="button" class="btn btn-primary" id="modalOk">保存</button></div>`);
+
+  if (isExpense) {
+    const cat = $('#editTxCategory');
+    const mealField = $('#editTxMealField');
+    const syncMeal = () => {
+      mealField.hidden = cat.value !== MEAL_PARENT;
+      if (mealField.hidden) $('#editTxMeal').value = '';
+    };
+    cat.addEventListener('change', syncMeal);
+    syncMeal();
+  }
+  $('#modalCancel').addEventListener('click', closeModal);
+  $('#modalOk').addEventListener('click', () => {
+    const amountInput = $('#editTxAmount');
+    const amount = round2(Number(amountInput.value));
+    const dateInput = $('#editTxDate');
+    if (!amountInput.value || !Number.isFinite(amount) || amount <= 0 || !amountInput.validity.valid) {
+      toast('请输入有效金额', 'err'); amountInput.focus(); return;
+    }
+    if (!dateInput.value || !dateInput.validity.valid) {
+      toast('请选择有效日期', 'err'); dateInput.focus(); return;
+    }
+    const current = Store.data.transactions.find((t) => t.id === id);
+    if (!current) { toast('这笔记录已不存在', 'err'); return; }
+    const account = $('#editTxAccount').value;
+    const oldKey = vaultKeyOfTx(current);
+    const newKey = account === current.account ? oldKey : vaultKeyOf(account);
+    const updated = { ...current, amount, account, date: dateInput.value, remark: $('#editTxRemark').value.trim() };
+    if (isExpense) {
+      updated.category = $('#editTxCategory').value;
+      updated.meal = mealForCategory(updated.category, $('#editTxMeal').value);
+    }
+    if (account !== current.account) updated.vaultKey = newKey;
+    const vault = { ...Store.data.vault };
+    const sign = isExpense ? -1 : 1;
+    if (oldKey !== newKey || amount !== current.amount) {
+      vault[oldKey] = round2(vault[oldKey] - sign * current.amount);
+      vault[newKey] = round2(vault[newKey] + sign * amount);
+    }
+    const next = { ...Store.data, vault, transactions: Store.data.transactions.map((t) => t === current ? updated : t) };
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify(next));
+    } catch (e) {
+      console.error('保存失败', e);
+      toast('保存失败：本地存储空间不足或被禁用', 'err');
+      return;
+    }
+    Store.data = next;
+    if (typeof scheduleAutoPush === 'function') {
+      try { scheduleAutoPush(); } catch (e) { console.error('云同步调度失败', e); }
+    }
+    state.ledgerMonth = monthOf(updated.date);
+    $('#ledgerMonth').value = state.ledgerMonth;
+    closeModal();
+    renderLedger();
+    if (state.page === 'stats') renderStats();
+    if (state.page === 'vault') renderVault();
+    toast('账单已更新');
+  });
+  $('#editTxAmount').focus();
+}
 
 /** 切换某笔支出是否计入当月环形图 */
 function toggleCounted(id) {
@@ -2936,8 +3109,8 @@ function confirmDelete(id) {
 function deleteTx(id) {
   const tx = Store.data.transactions.find((t) => t.id === id);
   if (!tx) return;
-  // 回滚金库
-  Store.adjustVault(tx.account, tx.type === 'expense' ? tx.amount : -tx.amount);
+  // 回滚金库：按这笔当初实际动的池退回（历史微信账退零钱，新账退零钱通）
+  Store.adjustVault(vaultKeyOfTx(tx), tx.type === 'expense' ? tx.amount : -tx.amount);
   Store.removeTransaction(id);
   renderLedger();
   if (state.page === 'stats') renderStats();
@@ -2975,11 +3148,11 @@ function openChangeAccount(id) {
   $('#modalCancel').addEventListener('click', closeModal);
   $('#modalOk').addEventListener('click', () => {
     if (picked === tx.account) { closeModal(); return; }
-    const oldAcc = tx.account;
-    // 1) 原账户加回  2) 新账户扣除
-    Store.adjustVault(oldAcc, tx.amount);
-    Store.adjustVault(picked, -tx.amount);
+    // 1) 原账户按「当初实际动的池」加回  2) 新账户按当前默认规则扣除
+    Store.adjustVault(vaultKeyOfTx(tx), tx.amount);
+    Store.adjustVault(vaultKeyOf(picked), -tx.amount);
     tx.account = picked;
+    tx.vaultKey = vaultKeyOf(picked);   // 同步改写，保证日后回滚找对池
     Store.save();
     closeModal();
     renderLedger();
@@ -3230,6 +3403,7 @@ function renderMonthlySummary() {
   // ---- 详情面板 ----
   const panel = $('#msumPanel');
   const ym = state.summaryMonth;
+  const showComparison = ym < monthStr();
   const cur = monthCategoryTotals(ym);
   const prev = monthCategoryTotals(addMonths(ym, -1));
 
@@ -3237,7 +3411,7 @@ function renderMonthlySummary() {
     panel.hidden = false;
     panel.innerHTML = `
       <div class="msum-panel-head">
-        <span class="msum-panel-title">${icon('calendar-range')}${ym} 月度明细</span>
+        <span class="msum-panel-title">${icon('calendar-range')}${ym} 月度明细${showComparison ? '' : '<em>月结束后显示环比</em>'}</span>
         <span class="msum-panel-total">${money(0)}</span>
       </div>
       <div class="empty" style="padding:var(--sp-6) 0">
@@ -3256,21 +3430,33 @@ function renderMonthlySummary() {
     const body = rows.map((r) => {
       const color = CATEGORY_COLOR[r.cat] || '#8798a0';
       return `
-        <li class="rank-item msum-row">
+        <li><button type="button" class="rank-item msum-row" data-summary-category="${escapeHtml(r.cat)}"
+          aria-expanded="${state.summaryCategory === r.cat}" aria-controls="msumCategoryBills">
           <span class="rank-name">${icon(CATEGORY_ICON[r.cat] || 'package')}${escapeHtml(r.cat)}</span>
           <span class="rank-track"><i style="width:${((r.amt / max) * 100).toFixed(1)}%;background:${color}"></i></span>
           <span class="rank-amt">${money(r.amt)}</span>
-          ${deltaHtml(r.amt, r.prevAmt)}
-        </li>`;
+          ${showComparison ? deltaHtml(r.amt, r.prevAmt) : ''}
+          ${icon(state.summaryCategory === r.cat ? 'chevron-up' : 'chevron-down')}
+        </button></li>`;
     }).join('');
+
+    const selected = rows.find((r) => r.cat === state.summaryCategory);
+    const categoryBills = selected
+      ? Store.getTransactions(ym).filter((t) => t.type === 'expense' && normalizeCategory(t.category) === selected.cat)
+      : [];
+    const details = selected ? `
+      <div class="msum-category-head"><strong>${escapeHtml(selected.cat)}账单</strong>
+        <span>${categoryBills.length} 笔 · ${money(selected.amt)}</span></div>
+      <ul class="bill-list">${categoryBills.map((t) => billRow(t)).join('')}</ul>` : '';
 
     panel.innerHTML = `
       <div class="msum-panel-head">
         <span class="msum-panel-title">${icon('git-compare')}${ym} 月度明细
-          <em>对比 ${addMonths(ym, -1)}</em></span>
-        <span class="msum-panel-total">${money(cur.total)} ${deltaHtml(cur.total, prev.total)}</span>
+          <em>${showComparison ? `对比 ${addMonths(ym, -1)}` : '月结束后显示环比'}</em></span>
+        <span class="msum-panel-total">${money(cur.total)} ${showComparison ? deltaHtml(cur.total, prev.total) : ''}</span>
       </div>
       <ul class="rank-list msum-rows">${body}</ul>
+      <div id="msumCategoryBills" class="msum-category-bills"${selected ? '' : ' hidden'}>${details}</div>
       <div class="msum-panel-foot">${cur.count} 笔支出 · 全部支出合计 ${money(cur.total)}</div>`;
   }
 
@@ -3299,18 +3485,55 @@ function renderMonthlySummary() {
 function initMonthlySummary() {
   const card = $('#monthlySummaryCard');
   if (!card) return;
+  let lastMonth = monthStr();
+  let midnightTimer;
+  const refreshIfMonthChanged = () => {
+    const currentMonth = monthStr();
+    if (currentMonth !== lastMonth) {
+      lastMonth = currentMonth;
+      if (state.page === 'stats') renderMonthlySummary();
+    }
+  };
+  const scheduleMidnightCheck = () => {
+    clearTimeout(midnightTimer);
+    const now = new Date();
+    const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+    midnightTimer = setTimeout(() => {
+      refreshIfMonthChanged();
+      scheduleMidnightCheck();
+    }, tomorrow - now + 100);
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      refreshIfMonthChanged();
+      scheduleMidnightCheck();
+    }
+  });
+  scheduleMidnightCheck();
   card.addEventListener('click', (e) => {
     const yearBtn = e.target.closest('#msumPrevYear, #msumNextYear');
     if (yearBtn) {
       state.summaryYear += (yearBtn.id === 'msumNextYear' ? 1 : -1);
       state.summaryMonth = `${state.summaryYear}-01`; // 切年后落到该年 1 月
+      state.summaryCategory = null;
       renderMonthlySummary();
       return;
     }
     const monthBtn = e.target.closest('.month-btn, .msum-col');
     if (monthBtn && monthBtn.dataset.month) {
       state.summaryMonth = monthBtn.dataset.month;
+      state.summaryCategory = null;
       renderMonthlySummary();
+      return;
+    }
+    const categoryBtn = e.target.closest('[data-summary-category]');
+    if (categoryBtn) {
+      const category = categoryBtn.dataset.summaryCategory;
+      state.summaryCategory = state.summaryCategory === category ? null : category;
+      renderMonthlySummary();
+      const newButton = Array.from(card.querySelectorAll('[data-summary-category]'))
+        .find((button) => button.dataset.summaryCategory === category);
+      if (newButton) newButton.focus();
     }
   });
 }

@@ -85,7 +85,7 @@
             <div class="stat-foot" id="ovIncomeFoot">已入账收入</div>
           </div>
           <div class="stat-card">
-            <div class="stat-head"><i data-lucide="wallet"></i>剩余预算</div>
+            <div class="stat-head"><i data-lucide="wallet"></i><span id="ovRemainHead">剩余预算</span></div>
             <div class="stat-value" id="ovRemain">¥0.00</div>
             <div class="stat-foot" id="ovRemainFoot">本月可用</div>
           </div>
@@ -113,12 +113,12 @@
               <span class="gauge-value" id="gaugeLimit">¥1500.00</span>
             </div>
             <div class="gauge-divider"></div>
-            <div class="gauge-row highlight">
-              <span class="gauge-label">本月剩余可支配</span>
+            <div class="gauge-row highlight" id="gaugeRemainRow">
+              <span class="gauge-label" id="gaugeRemainLabel">本月剩余可支配</span>
               <span class="gauge-value big" id="gaugeRemain">¥1500.00</span>
             </div>
-            <div class="gauge-row">
-              <span class="gauge-label"><i data-lucide="calendar-days"></i>剩余每日平均花费上限</span>
+            <div class="gauge-row" id="gaugeDailyRow">
+              <span class="gauge-label"><i data-lucide="calendar-days"></i>剩余日均可用</span>
               <span class="gauge-value" id="gaugeDaily">¥0.00</span>
             </div>
             <div class="gauge-state" id="gaugeState">正常</div>
@@ -153,11 +153,13 @@
             </div>
 
             <div class="form-field">
-              <label class="field-label" for="dateLedger"><i data-lucide="calendar"></i>日期</label>
+              <div class="entry-date-head"><label class="field-label" for="dateLedger"><i data-lucide="calendar"></i>日期</label>
+                <button type="button" class="btn-mini entry-today" data-entry-today>回到今天</button></div>
               <div class="date-field">
                 <input type="date" class="f-date input" id="dateLedger" />
                 <i data-lucide="calendar-days"></i>
               </div>
+              <div class="entry-date-hint" data-entry-date-hint aria-live="polite" hidden></div>
             </div>
 
             <div class="form-field">
@@ -176,6 +178,14 @@
           <div class="list-head">
             <h2><i data-lucide="receipt-text"></i>账单明细</h2>
           </div>
+          <div class="bill-filters">
+            <input type="search" class="input" id="billSearch" placeholder="搜索备注，例如：耳机" aria-label="搜索账单备注" />
+            <select class="input" id="billCategoryFilter" aria-label="筛选账单分类"><option value="">全部分类</option></select>
+            <select class="input" id="billSearchScope" aria-label="搜索范围">
+              <option value="all">全部月份</option><option value="month">所选月份</option>
+            </select>
+          </div>
+          <div class="bill-filter-hint">输入备注或选择分类后，按搜索范围查找账单</div>
           <div class="list-summary" id="listSummary"></div>
           <ul class="bill-list" id="billList"></ul>
         </div>
@@ -307,7 +317,7 @@
             <div class="page-sub">收藏故事，记录每一段观影旅程</div>
           </div>
           <div class="head-actions">
-            <a class="shows-link" id="showsLink" href="https://iioo.me/"
+            <a class="shows-link" id="showsLink" href="https://www.libvio.app/"
                target="_blank" rel="noopener noreferrer">
               <i data-lucide="external-link"></i>点此去看剧
             </a>
@@ -377,7 +387,7 @@
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <script src="vendor/lucide.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@tencent-ai/workbuddy-cloud-sdk@dev/lib/index.global.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tencent-ai/workbuddy-cloud-sdk@0.1.4-dev.ca27990.202610161713/lib/index.global.js" integrity="sha384-6yxnkOdsYedUWX/Z+ulluqqMcfvl4EimVdKA7jFGD8P8a6yUWNPqK+du0PSKiGWJ" crossorigin="anonymous"></script>
   <script src="app.js"></script>
   <script src="tvmaze.js"></script>
   <script src="cloud.js"></script>

@@ -22,6 +22,7 @@ const CLOUD_PUBLIC_CONFIG = {
 };
 
 const CLOUD_TABLE = 'finance_state';
+// 自动上传保持关闭；已有云端记录允许用户确认后发送带版本条件的手动更新。
 /** 登录态缓存的用户邮箱（只用于界面展示，不含敏感凭证） */
 const CLOUD_EMAIL_KEY = 'life_assistant_cloud_email';
 
@@ -29,6 +30,10 @@ const CLOUD_EMAIL_KEY = 'life_assistant_cloud_email';
 let cloudClient = null;
 /** 当前会话缓存：{ user } 或 null（未登录） */
 let cloudSession = null;
+let cloudStatus = '待确认';
+let cloudComparison = null;
+let cloudCheckGeneration = 0;
+let cloudExternalChange = false;
 
 /** 初始化云客户端；SDK 未加载或不可用时返回 null（App 继续以纯本地模式运行） */
 function ensureCloudClient() {
@@ -61,7 +66,7 @@ function renderSyncEntry() {
 
   const on = isCloudSignedIn();
   wrap.innerHTML = icon(on ? 'cloud' : 'cloud-off');
-  text.textContent = on ? '云同步已开启' : '开启云同步';
+  text.textContent = on ? `云同步：${cloudStatus}` : '开启云同步';
   btn.classList.toggle('on', on);
   refreshIcons(wrap);
 }
@@ -77,12 +82,12 @@ function renderCloudCard() {
   const signed = isCloudSignedIn();
   const email = getCloudEmail();
 
-  badge.textContent = signed ? '已登录' : '未登录';
+  badge.textContent = signed ? cloudStatus : '未登录';
   badge.classList.toggle('on', signed);
 
   if (!signed) {
     body.innerHTML = `
-      <p class="sync-desc">登录后，账本会自动保存到云端，手机和电脑用同一个账号即可看到相同数据。</p>
+      <p class="sync-desc">登录后先比较本机与云端账本，不会自动覆盖。</p>
       <div class="sync-actions">
         <button class="btn btn-primary" id="cloudLoginBtn" type="button">
           ${icon('log-in')}登录 / 注册
@@ -93,24 +98,46 @@ function renderCloudCard() {
     return;
   }
 
+  const comparison = cloudComparison;
+  const latestBackup = latestCloudRestoreBackup();
+  const summary = comparison ? `
+    <div class="cloud-comparison" aria-live="polite">
+      <p>本机：${escapeHtml(cloudSummary(comparison.local))}</p>
+      <p>云端：${comparison.remote ? escapeHtml(cloudSummary(comparison.remote.payload)) : '暂无账本'}</p>
+      <p>云端更新时间：${escapeHtml(comparison.remote && comparison.remote.updated_at || '暂无')}</p>
+      <p>${comparison.equal ? '两边数据一致。' : '两边数据不同，请先导出备份，再选择处理方式。'}</p>
+      <p>操作涉及整份数据，包括账单、金库、观影和单词。</p>
+    </div>` : '<p class="sync-desc">请先比较本机与云端；未确认前不会自动覆盖。</p>';
   body.innerHTML = `
     <p class="sync-desc">
-      ${icon('circle-check')}已登录：<b>${escapeHtml(email || '当前账号')}</b>
-      <br><span class="sync-sub">数据已同步到云端，换设备登录同一账号即可看到。</span>
+      ${icon('cloud')}已登录：<b>${escapeHtml(email || '当前账号')}</b>
+      <br><span class="sync-sub">当前状态：${escapeHtml(cloudStatus)}。自动上传已暂停，手动上传前请备份并确认其他设备没有修改云端。</span>
     </p>
+    ${summary}
     <div class="sync-actions">
-      <button class="btn btn-primary" id="cloudPushBtn" type="button">
-        ${icon('cloud-upload')}立即上传
+      <button class="btn btn-primary" id="cloudCompareBtn" type="button">
+        ${icon('refresh-cw')}比较本机和云端
       </button>
-      <button class="btn btn-ghost" id="cloudPullBtn" type="button">
-        ${icon('cloud-download')}从云端恢复
-      </button>
-      <button class="btn btn-ghost" id="cloudLogoutBtn" type="button">
-        ${icon('log-out')}退出登录
-      </button>
+      ${latestBackup ? '<button class="btn btn-ghost" id="cloudExportPreviousBtn" type="button">导出恢复前本机备份</button>' : ''}
+      ${comparison ? `<button class="btn btn-ghost" id="cloudExportLocalBtn" type="button">导出本机备份</button>
+      ${comparison.remote ? '<button class="btn btn-ghost" id="cloudExportRemoteBtn" type="button">导出云端备份</button>' : ''}
+      <button class="btn btn-ghost" id="cloudPushBtn" type="button"${comparison.remote && comparison.remote.id && comparison.remote.updated_at ? '' : ' disabled title="没有可验证的云端版本，暂不能上传"'}>保留本地并上传</button>
+      ${comparison.remote ? '<button class="btn btn-ghost" id="cloudPullBtn" type="button">恢复云端到本地</button>' : ''}
+      <button class="btn btn-ghost" id="cloudLaterBtn" type="button">稍后处理</button>` : ''}
+      <button class="btn btn-ghost" id="cloudLogoutBtn" type="button">${icon('log-out')}退出登录</button>
     </div>`;
-  body.querySelector('#cloudPushBtn').addEventListener('click', () => cloudPush(true));
-  body.querySelector('#cloudPullBtn').addEventListener('click', () => cloudPull(true));
+  body.querySelector('#cloudCompareBtn').addEventListener('click', () => compareCloud());
+  const previousBackup = body.querySelector('#cloudExportPreviousBtn');
+  if (previousBackup) previousBackup.addEventListener('click', () => exportCloudSnapshot(latestBackup, '恢复前本机账本'));
+  if (comparison) {
+    body.querySelector('#cloudExportLocalBtn').addEventListener('click', () => exportData());
+    const remoteExport = body.querySelector('#cloudExportRemoteBtn');
+    if (remoteExport) remoteExport.addEventListener('click', () => exportCloudSnapshot(comparison.remote.payload));
+    body.querySelector('#cloudPushBtn').addEventListener('click', () => confirmCloudAction('push'));
+    const pull = body.querySelector('#cloudPullBtn');
+    if (pull) pull.addEventListener('click', () => confirmCloudAction('pull'));
+    body.querySelector('#cloudLaterBtn').addEventListener('click', () => { cloudComparison = null; setCloudStatus('待确认'); });
+  }
   body.querySelector('#cloudLogoutBtn').addEventListener('click', cloudSignOut);
   refreshIcons(body);
 }
@@ -222,9 +249,8 @@ function openLoginModal() {
         return;
       }
       const user = completed.data && completed.data.user ? completed.data.user : null;
-      onCloudSignedIn(user);
       closeModal();
-      toast('云同步已开启');
+      await onCloudSignedIn(user);
     } catch (e) {
       setHint('登录失败，请稍后重试', true);
       okBtn.disabled = false;
@@ -261,14 +287,13 @@ function isCloudSignedIn() {
   return !!(cloudSession && cloudSession.user);
 }
 
-/** 登录成功后的统一处理：记会话、同步一次数据 */
+/** 登录后只比较，不自动覆盖任一端。 */
 async function onCloudSignedIn(user) {
   cloudSession = { user };
   setCloudEmail(user && user.email ? user.email : '');
-  renderSyncEntry();
-  renderCloudCard();
-  // 首次登录：以云端为准拉取（云端为空则把本地推上去）
-  await cloudPull(false);
+  cloudComparison = null;
+  setCloudStatus('待确认');
+  await compareCloud();
 }
 
 /** 退出登录：清会话。本地数据保留，不影响离线使用。 */
@@ -278,6 +303,9 @@ async function cloudSignOut() {
     if (cloud) await cloud.auth.signOut();
   } catch (_) {}
   cloudSession = null;
+  cloudCheckGeneration++;
+  cloudComparison = null;
+  cloudStatus = '待确认';
   setCloudEmail('');
   renderSyncEntry();
   renderCloudCard();
@@ -301,97 +329,186 @@ async function restoreCloudSession() {
   }
   renderSyncEntry();
   renderCloudCard();
+  if (isCloudSignedIn()) await compareCloud();
 }
 
 /* ---------------------- 数据同步：整份账本快照 ---------------------- */
-/** 把本地账本推送到云端（upsert：有则更新，无则新建） */
-async function cloudPush(showToast) {
-  if (!isCloudSignedIn()) { if (showToast) toast('请先登录', 'err'); return false; }
+function setCloudStatus(status) {
+  cloudStatus = status;
+  renderSyncEntry();
+  renderCloudCard();
+}
+
+function stableCloudJson(value) {
+  if (Array.isArray(value)) return '[' + value.map(stableCloudJson).join(',') + ']';
+  if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map((k) => JSON.stringify(k) + ':' + stableCloudJson(value[k])).join(',') + '}';
+  return JSON.stringify(value);
+}
+
+function cloudSummary(data) {
+  const txs = Array.isArray(data && data.transactions) ? data.transactions : [];
+  const dates = txs.map((t) => t && t.date).filter((d) => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}/.test(d)).map((d) => d.slice(0, 10)).sort();
+  return `${txs.length} 笔账单 · ${dates.length ? `${dates[0]} 至 ${dates[dates.length - 1]}` : '无账单日期'}`;
+}
+
+async function readCloudSnapshot() {
   const cloud = ensureCloudClient();
-  if (!cloud) { if (showToast) toast('云服务不可用', 'err'); return false; }
+  if (!cloud) throw new Error('云服务不可用');
+  const result = await cloud.database.from(CLOUD_TABLE).select('id, payload, updated_at').limit(2);
+  if (result.error) throw new Error(result.error.message || '读取云端失败');
+  if (!Array.isArray(result.data)) throw new Error('云端返回格式异常');
+  if (result.data.length > 1) throw new Error('云端存在多个账本，请勿覆盖');
+  const row = result.data[0] || null;
+  if (row && (!row.payload || typeof row.payload !== 'object' || Array.isArray(row.payload) || !Array.isArray(row.payload.transactions))) throw new Error('云端账本格式异常');
+  return row ? JSON.parse(JSON.stringify(row)) : null;
+}
 
+async function compareCloud() {
+  if (!isCloudSignedIn()) { toast('请先登录', 'err'); return false; }
+  if (cloudExternalChange) { setCloudStatus('待确认'); toast('其他页面修改了本机账本，请刷新后重新比较', 'err'); return false; }
+  const generation = ++cloudCheckGeneration;
+  const account = cloudSession;
+  const local = JSON.parse(JSON.stringify(Store.data));
+  const localJson = stableCloudJson(local);
+  let localRaw;
+  try { localRaw = localStorage.getItem(STORE_KEY); } catch (_) { setCloudStatus('同步失败'); toast('无法读取本机数据', 'err'); return false; }
   try {
-    // 先查是否已有本行（RLS 保证只查到自己的）
-    const { data: rows, error: selErr } = await cloud.database
-      .from(CLOUD_TABLE)
-      .select('id')
-      .limit(1);
-    if (selErr) { if (showToast) toast('读取云端失败：' + selErr.message, 'err'); return false; }
-
-    const payload = Store.data;
-    let res;
-    if (rows && rows.length) {
-      // 更新已有行（不传 owner_id）
-      res = await cloud.database
-        .from(CLOUD_TABLE)
-        .update({ payload, updated_at: new Date().toISOString() })
-        .eq('id', rows[0].id)
-        .select();
-    } else {
-      // 新建行（owner_id 由数据库 DEFAULT auth.uid() 填充）
-      res = await cloud.database
-        .from(CLOUD_TABLE)
-        .insert({ payload })
-        .select();
+    if (!localRaw) throw new Error('unsaved');
+    const stored = JSON.parse(localRaw);
+    if (stableCloudJson(stored) !== localJson) {
+      // Store.load() 在校验前持久化迁移结果；仅在隔离副本上重放处理，
+      // 避免把正常的历史格式转换误认为未保存，也不会写入或上传账本。
+      const normalized = Object.assign(Object.create(Store), { data: stored, save() { return true; } });
+      normalized.migrate();
+      normalized.sanitize();
+      if (stableCloudJson(normalized.data) !== localJson) throw new Error('unsaved');
     }
-    if (res.error) { if (showToast) toast('同步失败：' + res.error.message, 'err'); return false; }
-
-    setLastSyncAt();
-    if (showToast) toast('已上传到云端');
-    renderCloudCard();
+  } catch (_) {
+    cloudComparison = null;
+    setCloudStatus('待确认');
+    toast('本机内存与已保存账本不一致，请先导出备份并刷新页面', 'err');
+    return false;
+  }
+  cloudComparison = null;
+  setCloudStatus('同步中');
+  try {
+    const remote = await readCloudSnapshot();
+    if (generation !== cloudCheckGeneration || cloudSession !== account) return false;
+    if (stableCloudJson(Store.data) !== localJson || localStorage.getItem(STORE_KEY) !== localRaw) {
+      setCloudStatus('待确认'); toast('本机数据已变化，请重新比较', 'err'); return false;
+    }
+    const equal = !!remote && stableCloudJson(remote.payload) === localJson;
+    cloudComparison = { local, localJson, localRaw, remote, equal };
+    setCloudStatus(equal ? '已同步' : '待确认');
     return true;
   } catch (e) {
-    console.error('[云同步] 上传失败', e);
-    if (showToast) toast('同步失败，请检查网络', 'err');
+    if (generation === cloudCheckGeneration) { cloudComparison = null; setCloudStatus('同步失败'); toast(`比较失败：${e.message}`, 'err'); }
     return false;
   }
 }
 
-/** 从云端拉取并覆盖本地（云端为空时，改为把本地推上去做初始化） */
-async function cloudPull(showToast) {
-  if (!isCloudSignedIn()) { if (showToast) toast('请先登录', 'err'); return false; }
-  const cloud = ensureCloudClient();
-  if (!cloud) { if (showToast) toast('云服务不可用', 'err'); return false; }
-
+function latestCloudRestoreBackup() {
   try {
-    const { data: rows, error } = await cloud.database
-      .from(CLOUD_TABLE)
-      .select('payload, updated_at')
-      .limit(1);
-    if (error) { if (showToast) toast('读取云端失败：' + error.message, 'err'); return false; }
+    const prefix = `${STORE_KEY}_backup_before_cloud_`;
+    const key = Object.keys(localStorage).filter((k) => k.startsWith(prefix) && !k.endsWith('_original')).sort().reverse()[0];
+    return key ? JSON.parse(localStorage.getItem(key)) : null;
+  } catch (_) { return null; }
+}
 
-    if (!rows || !rows.length) {
-      // 云端还没有数据：把本地推上去，完成首次初始化
-      return cloudPush(showToast);
-    }
+function exportCloudSnapshot(payload, label = '云端账本') {
+  const blob = new Blob([JSON.stringify({ app: 'life-assistant', exportedAt: new Date().toISOString(), data: payload }, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `${label}备份_${todayStr()}.json`; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
-    const payload = rows[0].payload;
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-      if (showToast) toast('云端数据格式异常，已跳过', 'err');
-      return false;
-    }
+function confirmCloudAction(action) {
+  if (!cloudComparison) { toast('请先比较本机和云端', 'err'); return; }
+  const comparison = cloudComparison;
+  openModal(`
+    <h3>${icon('circle-alert')}确认${action === 'push' ? '上传本机账本' : '恢复云端账本'}</h3>
+    <p>${action === 'push' ? '云端整份账本将被本机版本覆盖' : '本机整份账本将被云端版本覆盖'}，包括账单、金库、观影和单词。请先导出两边备份。</p>
+    ${action === 'push' ? '<p>上传会检查云端版本，但真实云服务的并发保护尚未验证。请先停止其他设备上的同步操作。</p>' : ''}
+    <p>本机：${escapeHtml(cloudSummary(comparison.local))}<br>云端：${comparison.remote ? escapeHtml(cloudSummary(comparison.remote.payload)) : '暂无账本'}</p>
+    <div class="modal-actions"><button class="btn btn-ghost" id="modalCancel" type="button">取消</button><button class="btn btn-danger-soft" id="modalOk" type="button">确认${action === 'push' ? '上传' : '恢复'}</button></div>`);
+  $('#modalCancel').addEventListener('click', closeModal);
+  $('#modalOk').addEventListener('click', async () => {
+    $('#modalOk').disabled = true;
+    closeModal();
+    if (action === 'push') await cloudPush(true, comparison);
+    else await cloudPull(true, comparison);
+  });
+}
 
-    // 用云端数据覆盖本地，并走一遍迁移/校验，保证结构完整
-    Store.data = payload;
-    Store.migrate();
-    Store.sanitize();
-    Store.save();
+async function verifyCloudComparison(expected) {
+  if (!expected || cloudExternalChange || cloudComparison !== expected || stableCloudJson(Store.data) !== expected.localJson || localStorage.getItem(STORE_KEY) !== expected.localRaw) throw new Error('本机数据已变化，请重新比较');
+  const row = await readCloudSnapshot();
+  if (cloudComparison !== expected || stableCloudJson(Store.data) !== expected.localJson || localStorage.getItem(STORE_KEY) !== expected.localRaw || stableCloudJson(row) !== stableCloudJson(expected.remote)) throw new Error('本机或云端数据已变化，请重新比较');
+  return row;
+}
 
-    // 重新渲染全部界面
-    applyAppName();
-    if (typeof renderLedger === 'function') renderLedger();
-    if (typeof renderStats === 'function') renderStats();
-    if (typeof renderVault === 'function') renderVault();
-    // 观影页（内部会异步回填本地封面；跨设备缺图时自动降级为占位）
-    if (typeof renderShows === 'function') renderShows();
-
-    setLastSyncAt(rows[0].updated_at);
-    if (showToast) toast('已从云端恢复');
-    renderCloudCard();
+async function cloudPush(showToast, expected) {
+  if (!isCloudSignedIn()) { if (showToast) toast('请先登录', 'err'); return false; }
+  if (!expected) { if (showToast) toast('请先比较并确认', 'err'); return false; }
+  try {
+    const row = await verifyCloudComparison(expected);
+    if (!row || !row.id || !row.updated_at) throw new Error('无法验证云端版本，上传已暂停');
+    const priorTime = Date.parse(row.updated_at);
+    if (!Number.isFinite(priorTime)) throw new Error('云端版本时间无效，上传已暂停');
+    setCloudStatus('同步中');
+    const result = await ensureCloudClient().database.from(CLOUD_TABLE)
+      .update({ payload: expected.local, updated_at: new Date(Math.max(Date.now(), priorTime + 1)).toISOString() })
+      .eq('id', row.id).eq('updated_at', row.updated_at).select();
+    if (result.error) throw new Error(result.error.message || '上传失败');
+    if (!Array.isArray(result.data) || result.data.length !== 1) throw new Error('云端版本已变化或无法确认更新结果');
+    cloudComparison = null;
+    setCloudStatus('待确认');
+    if (showToast) toast('上传请求已完成，请重新比较确认');
+    await compareCloud();
     return true;
   } catch (e) {
-    console.error('[云同步] 下载失败', e);
-    if (showToast) toast('恢复失败，请检查网络', 'err');
+    cloudComparison = null; setCloudStatus('同步失败');
+    if (showToast) toast(`${e.message}，请重新比较`, 'err');
+    return false;
+  }
+}
+
+async function cloudPull(showToast, expected) {
+  if (!isCloudSignedIn()) { if (showToast) toast('请先登录', 'err'); return false; }
+  if (!expected) { if (showToast) toast('请先比较并确认', 'err'); return false; }
+  try {
+    const row = await verifyCloudComparison(expected);
+    if (!row) throw new Error('云端没有账本');
+    const backup = JSON.stringify(Store.data);
+    const backupKey = `${STORE_KEY}_backup_before_cloud_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    localStorage.setItem(backupKey, backup);
+    if (localStorage.getItem(backupKey) !== backup) throw new Error('本机备份未能验证');
+    if (expected.localRaw && expected.localRaw !== backup) {
+      localStorage.setItem(`${backupKey}_original`, expected.localRaw);
+      if (localStorage.getItem(`${backupKey}_original`) !== expected.localRaw) throw new Error('原始本机备份未能验证');
+    }
+    const temporary = Object.assign(Object.create(Store), { data: JSON.parse(JSON.stringify(row.payload)), save() { return true; } });
+    temporary.migrate(); temporary.sanitize();
+    for (const field of ['transactions', 'shows', 'watchLogs', 'wordCards']) {
+      if (Array.isArray(row.payload[field]) && temporary.data[field].length !== row.payload[field].length) throw new Error('云端账本校验会丢失记录，已停止恢复');
+    }
+    if (stableCloudJson(Store.data) !== expected.localJson || localStorage.getItem(STORE_KEY) !== expected.localRaw) throw new Error('本机数据已变化');
+    localStorage.setItem(STORE_KEY, JSON.stringify(temporary.data));
+    Store.data = temporary.data;
+    cloudComparison = null;
+    try {
+      applyAppName(); renderLedger(); renderStats(); renderVault();
+      if (typeof renderShows === 'function') renderShows();
+      if (typeof renderWords === 'function') renderWords();
+    } catch (e) { console.error('账本已恢复，但页面刷新失败', e); }
+    setCloudStatus('待确认');
+    if (showToast) toast('已恢复云端账本，本机原账本已备份');
+    await compareCloud();
+    return true;
+  } catch (e) {
+    cloudComparison = null; setCloudStatus('同步失败');
+    if (showToast) toast(`恢复失败：${e.message}`, 'err');
     return false;
   }
 }
@@ -403,12 +520,12 @@ function setLastSyncAt(iso) {
 }
 
 /* ---------------------- 变更后自动上传（节流） ---------------------- */
-let autoPushTimer = null;
-/** 本地数据变更后调用：登录状态下延迟 1.5s 自动上传，避免频繁请求 */
+/** 未验证服务端条件更新前，不执行自动上传。 */
 function scheduleAutoPush() {
   if (!isCloudSignedIn()) return;
-  clearTimeout(autoPushTimer);
-  autoPushTimer = setTimeout(() => { cloudPush(false); }, 1500);
+  cloudCheckGeneration++;
+  cloudComparison = null;
+  setCloudStatus('待确认');
 }
 
 /* ---------------------- 初始化 ---------------------- */
@@ -427,5 +544,11 @@ function initCloudSync() {
 
   renderSyncEntry();
   renderCloudCard();
+  window.addEventListener('storage', (e) => {
+    if (e.key === STORE_KEY) {
+      cloudExternalChange = true;
+      if (isCloudSignedIn()) scheduleAutoPush();
+    }
+  });
   restoreCloudSession();
 }

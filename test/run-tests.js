@@ -42,8 +42,11 @@ function boot() {
     window.AbortController = function () { this.signal = null; this.abort = function () {}; };
   }
   // app.js / tvmaze.js / cloud.js 合并进同一 IIFE（三者按名互相调用）
+  // 测试将三个独立脚本拼进同一作用域；等全部模块声明后再触发初始化，
+  // 避免 jsdom 已加载时 app.js 提前访问尚未初始化的 cloud.js 变量。
+  const deferredAppJs = appJs.replace("if (document.readyState !== 'loading') init();", '');
   const instrumented =
-    '(function(){\n' + appJs + '\n' + tvmazeJs + '\n' + cloudJs + '\n' +
+    '(function(){\n' + deferredAppJs + '\n' + tvmazeJs + '\n' + cloudJs + '\n' +
     'window.__app = { Store, state, CATEGORIES, CATEGORY_ICON, CATEGORY_COLOR, ACCOUNTS, ' +
     'normalizeCategory, MEALS, MEAL_PARENT, normalizeMeal, mealForCategory, ' +
     'renderLedger, renderStats, renderVault, switchPage, todayStr, monthStr, ' +
@@ -71,6 +74,7 @@ function boot() {
     'openAddWordCardModal, openEditWordCardModal, openWordCardModal, openDeleteWordCardModal, ' +
     'isMeaningMultiline, markWordMeaningLines, measureWordLines, scheduleWordLineRecalc, ' +
     'WORD_CARD_GAP, layoutWordCardSpans, ' +
+    'deleteTx, vaultKeyOf, vaultKeyOfTx, VAULT_KEYS, ' +
     'initWordsPage };\n' +
     // coverPickerState 是被整体重新赋值的 let 变量，直接放进对象会快照化，
     // 因此用 getter 暴露实时值
@@ -422,14 +426,15 @@ test('需求4 账户顺序 微信→支付宝→银行，默认微信', (w) => {
   submit(w, form);
   const txs = w.__app.Store.data.transactions;
   ok(txs.length === 1 && txs[0].account === 'wechat', '默认记账扣款账户为微信');
-  ok(w.__app.Store.data.vault.wechat_change === -11, '微信默认从「零钱」扣减（零钱 -11）');
-  ok(w.__app.Store.data.vault.wechat_lct === 0, '「零钱通」余额不受影响');
+  ok(w.__app.Store.data.vault.wechat_lct === -11, '微信默认从「零钱通」扣减（零钱通 -11）');
+  ok(w.__app.Store.data.vault.wechat_change === 0, '「零钱」余额不受影响');
+  ok(txs[0].vaultKey === 'wechat_lct', '账单记录了实际扣款池（vaultKey = wechat_lct）');
 });
 
-/* ---------- 需求 5：剩余每日平均花费上限 ---------- */
-test('需求5 显示剩余每日平均花费上限', (w) => {
+/* ---------- 需求 5：剩余日均可用额度 ---------- */
+test('需求5 显示剩余日均可用额度', (w) => {
   const el = w.document.querySelector('#gaugeDaily');
-  ok(!!el, '记账页存在「每日平均花费上限」元素');
+  ok(!!el, '记账页存在「剩余日均可用」元素');
 
   const { Store, state } = w.__app;
   const m = w.__app.monthStr();
@@ -441,7 +446,7 @@ test('需求5 显示剩余每日平均花费上限', (w) => {
   w.__app.renderLedger();
 
   const txt = el.textContent;
-  ok(/¥\d/.test(txt), `日均上限显示为金额（当前「${txt}」）`);
+  ok(/¥\d/.test(txt), `日均可用显示为金额（当前「${txt}」）`);
 
   // 逻辑校验：日均 = 剩余 / 本月剩余天数（含当天）
   const d = new Date();
@@ -451,12 +456,63 @@ test('需求5 显示剩余每日平均花费上限', (w) => {
   const got = (txt.match(/¥(-?[\d.]+)/) || [])[1];
   ok(got === expect, `日均金额计算正确（期望 ${expect}，实际 ${got}）`);
 
-  // 超额时应为负
+  // 超额后「日均额度」没有意义（旧版会算出 -¥xx），改为整行隐藏，超额金额由主数值行承担
   Store.data.transactions = [];
   Store.addTransaction({ id: 't2', type: 'expense', amount: 2000, category: '吃饭', account: 'wechat', remark: '', date: ds, createdAt: Date.now() });
   w.__app.renderLedger();
-  const txt2 = w.document.querySelector('#gaugeDaily').textContent;
-  ok(/-¥/.test(txt2), `超额时日均上限显示为负（当前「${txt2}」）`);
+  const row = w.document.querySelector('#gaugeDailyRow');
+  ok(row && row.style.display === 'none', '超额时日均行整行隐藏');
+  ok(w.document.querySelector('#gaugeRemainLabel').textContent === '本月已超额',
+    '超额时主数值行文案切为「本月已超额」');
+  ok(w.document.querySelector('#gaugeRemain').textContent === '¥500.00',
+    '主数值行只显示超额金额、不带负号');
+  ok(w.document.querySelector('#gaugeState').textContent.includes('已超上限'),
+    '徽章改为显示超出上限的比例');
+});
+
+/* ---------- 需求 5b：超额态文案与恢复正常态 ---------- */
+test('需求5b 超额态文案与复原', (w) => {
+  const { Store } = w.__app;
+  const m = w.__app.monthStr();
+  const ds = w.__app.todayStr();
+  const q = (sel) => w.document.querySelector(sel);
+  const dailyRow = () => q('#gaugeDailyRow');
+
+  // 1) 未超额：上限 1500 / 支出 300
+  Store.data.transactions = [];
+  Store.setLimit(m, 1500);
+  Store.addTransaction({ id: 'ov1', type: 'expense', amount: 300, category: '吃饭', account: 'wechat', remark: '', date: ds, createdAt: Date.now() });
+  w.__app.switchPage('ledger');
+  w.__app.renderLedger();
+  ok(dailyRow().style.display === '', '未超额时日均行正常显示');
+  ok(q('#gaugeRemainLabel').textContent === '本月剩余可支配', '未超额时标签为「本月剩余可支配」');
+  ok(q('#gaugeRemain').textContent === '¥1200.00', '未超额时显示剩余金额 1200');
+  ok(!q('#gaugeRemainRow').classList.contains('over'), '未超额时主数值行不带 over 类');
+  ok(q('#ovRemainHead').textContent === '剩余预算', '顶部卡标题为「剩余预算」');
+  ok(q('#gaugeState').textContent.includes('正常'), '徽章为「正常」');
+
+  // 2) 超额：上限 1500 / 支出 2000 → 超 500，进度 133%（超上限 33%）
+  Store.data.transactions = [];
+  Store.addTransaction({ id: 'ov2', type: 'expense', amount: 2000, category: '吃饭', account: 'wechat', remark: '', date: ds, createdAt: Date.now() });
+  w.__app.renderLedger();
+  ok(dailyRow().style.display === 'none', '超额时日均行隐藏');
+  ok(q('#gaugeRemainLabel').textContent === '本月已超额', '超额时标签切为「本月已超额」');
+  ok(q('#gaugeRemain').textContent === '¥500.00', '超额金额 500 且不带负号');
+  ok(q('#gaugeRemainRow').classList.contains('over'), '超额时主数值行带 over 类（标签转危险色）');
+  ok(q('#gaugeState').textContent.includes('已超上限 33%'), '徽章显示「已超上限 33%」');
+  ok(q('#gaugePct').textContent === '133%', '百分比保留 133%（不截断）');
+  ok(q('#ovRemainHead').textContent === '超出预算', '顶部卡标题切为「超出预算」');
+  ok(q('#ovRemain').textContent === '¥500.00', '顶部卡显示超额金额 500');
+  ok(q('#ovRemainFoot').textContent === '已超上限 33%', '顶部卡脚注显示超出比例');
+
+  // 3) 上限调到 2500（支出不变）→ 应恢复未超额态，验证隐藏可逆
+  Store.setLimit(m, 2500);
+  w.__app.renderLedger();
+  ok(dailyRow().style.display === '', '上限调高后日均行重新显示');
+  ok(q('#gaugeRemainLabel').textContent === '本月剩余可支配', '标签恢复「本月剩余可支配」');
+  ok(q('#gaugeRemain').textContent === '¥500.00', '剩余金额为 500');
+  ok(!q('#gaugeRemainRow').classList.contains('over'), 'over 类被摘除');
+  ok(q('#ovRemainHead').textContent === '剩余预算', '顶部卡标题恢复「剩余预算」');
 });
 
 /* ---------- 需求 6：本地持久化 ---------- */
@@ -480,7 +536,7 @@ test('需求6 数据持久化到 localStorage', (w) => {
   dom2.window.document.dispatchEvent(new dom2.window.Event('DOMContentLoaded', { bubbles: true }));
   const reloaded = JSON.stringify(dom2.window.__app.Store.data.transactions);
   ok(reloaded.includes('persist1'), '重新打开后数据仍存在（未丢失）');
-  ok(dom2.window.__app.Store.data.vault.wechat_change === -66, '金库余额也一并持久化（零钱）');
+  ok(dom2.window.__app.Store.data.vault.wechat_lct === -66, '金库余额也一并持久化（零钱通）');
 
   // 最近账单列表能渲染出该记录
   const listHtml = dom2.window.document.querySelector('#billList').innerHTML;
@@ -582,7 +638,7 @@ test('需求7 金库微信拆分为零钱与零钱通', (w) => {
   ok(w.document.querySelector('#totalAssets').textContent === '¥1100.00', '页面总资产显示正确');
 });
 
-test('需求7 记账扣款默认走零钱且不影响零钱通', (w) => {
+test('需求7 记账扣款默认走零钱通且不影响零钱', (w) => {
   const { Store } = w.__app;
   Store.data.transactions = [];
   Store.data.vault = { wechat_change: 200, wechat_lct: 800, alipay: 0, bank: 0 };
@@ -598,10 +654,10 @@ test('需求7 记账扣款默认走零钱且不影响零钱通', (w) => {
   submit(w, form);
 
   const v = Store.data.vault;
-  ok(v.wechat_change === 150, `扣款从「零钱」扣减（200 → ${v.wechat_change}）`);
-  ok(v.wechat_lct === 800, '「零钱通」完全不受影响');
+  ok(v.wechat_lct === 750, `扣款从「零钱通」扣减（800 → ${v.wechat_lct}）`);
+  ok(v.wechat_change === 200, '「零钱」完全不受影响');
 
-  // 收入默认入账：微信收入也进零钱
+  // 收入默认入账：微信收入也进零钱通
   const card = form.closest('.card');
   const incomeTab = Array.from(card.querySelectorAll('.tab')).find((t) => t.dataset.type === 'income');
   click(w, incomeTab);
@@ -609,8 +665,60 @@ test('需求7 记账扣款默认走零钱且不影响零钱通', (w) => {
   click(w, accSegs.find((s) => s.dataset.account === 'wechat'));
   form.querySelector('.f-amount').value = '30';
   submit(w, form);
-  ok(Store.data.vault.wechat_change === 180, `微信收入入「零钱」（150 → ${Store.data.vault.wechat_change}）`);
-  ok(Store.data.vault.wechat_lct === 800, '零钱通依旧不受影响');
+  ok(Store.data.vault.wechat_lct === 780, `微信收入入「零钱通」（750 → ${Store.data.vault.wechat_lct}）`);
+  ok(Store.data.vault.wechat_change === 200, '零钱依旧不受影响');
+});
+
+/* ---------- 需求 7b：历史账单回滚仍按当初的池 ---------- */
+test('需求7b 历史微信账单回滚退零钱，新账单退零钱通', (w) => {
+  const { Store } = w.__app;
+  const ds = w.__app.todayStr();
+  Store.data.transactions = [];
+  Store.data.vault = { wechat_change: 1000, wechat_lct: 1000, alipay: 0, bank: 0 };
+
+  // 1) 历史账单：没有 vaultKey 字段（改造前的记录），当初扣的是「零钱」
+  const legacy = { id: 'legacy1', type: 'expense', amount: 100, category: '吃饭', account: 'wechat', remark: '', date: ds, createdAt: Date.now() };
+  Store.addTransaction(legacy);
+  Store.data.vault.wechat_change = 900;   // 还原当初从零钱扣的 100
+  Store.data.vault.wechat_lct = 1000;
+  w.__app.deleteTx('legacy1');
+  ok(Store.data.vault.wechat_change === 1000, `旧账删除后金额退回「零钱」（当前 ${Store.data.vault.wechat_change}）`);
+  ok(Store.data.vault.wechat_lct === 1000, '旧账删除不影响「零钱通」');
+
+  // 2) 新账单：带 vaultKey = wechat_lct，删除后应退回零钱通
+  const fresh = { id: 'fresh1', type: 'expense', amount: 100, category: '吃饭', account: 'wechat', vaultKey: 'wechat_lct', remark: '', date: ds, createdAt: Date.now() };
+  Store.addTransaction(fresh);
+  Store.data.vault.wechat_lct = 900;   // 模拟当初从零钱通扣了 100
+  Store.data.vault.wechat_change = 1000;
+  w.__app.deleteTx('fresh1');
+  ok(Store.data.vault.wechat_lct === 1000, `新账删除后金额退回「零钱通」（当前 ${Store.data.vault.wechat_lct}）`);
+  ok(Store.data.vault.wechat_change === 1000, '新账删除不影响「零钱」');
+
+  // 3) 旧账改账户：原账户（零钱）加回，新账户按当前默认规则扣除
+  Store.data.vault = { wechat_change: 900, wechat_lct: 1000, alipay: 0, bank: 0 };
+  const legacy2 = { id: 'legacy2', type: 'expense', amount: 100, category: '吃饭', account: 'wechat', remark: '', date: ds, createdAt: Date.now() };
+  Store.addTransaction(legacy2);
+  ok(w.__app.vaultKeyOfTx(legacy2) === 'wechat_change', '无 vaultKey 的微信旧账按「零钱」回滚');
+  ok(w.__app.vaultKeyOfTx({ account: 'wechat', vaultKey: 'wechat_lct' }) === 'wechat_lct', '带 vaultKey 的按记录值回滚');
+  ok(w.__app.vaultKeyOfTx({ account: 'alipay' }) === 'alipay', '非微信账户回滚到同名金库键');
+  ok(w.__app.vaultKeyOfTx({ account: 'wechat', vaultKey: '瞎写的键' }) === 'wechat_change', '非法 vaultKey 退回历史默认（零钱）');
+
+  Store.data.transactions = [];
+});
+
+/* ---------- 需求 7c：非法 vaultKey 会被 sanitize 清理 ---------- */
+test('需求7c 非法 vaultKey 在加载时被清理', (w) => {
+  const { Store } = w.__app;
+  const ds = w.__app.todayStr();
+  Store.data.transactions = [
+    { id: 'bad1', type: 'expense', amount: 10, category: '吃饭', account: 'wechat', vaultKey: '不存在的键', remark: '', date: ds, createdAt: Date.now() },
+    { id: 'ok1', type: 'expense', amount: 10, category: '吃饭', account: 'wechat', vaultKey: 'wechat_lct', remark: '', date: ds, createdAt: Date.now() },
+  ];
+  Store.sanitize();
+  const bad = Store.data.transactions.find((t) => t.id === 'bad1');
+  const okTx = Store.data.transactions.find((t) => t.id === 'ok1');
+  ok(!('vaultKey' in bad), '非法 vaultKey 被删除（回滚时走账户默认池）');
+  ok(okTx.vaultKey === 'wechat_lct', '合法的 vaultKey 被保留');
 });
 
 /* ---------- 需求 8：账单明细可切换是否计入环形图 ---------- */
@@ -736,10 +844,10 @@ test('回归 改账户金额联动正确', (w) => {
   Store.adjustVault('alipay', -tx.amount);
   tx.account = 'alipay';
   Store.save();
-  ok(Store.data.vault.wechat_change === 0, '原账户（微信零钱）金额已加回至 0');
+  ok(Store.data.vault.wechat_lct === 0, '原账户（微信零钱通）金额已加回至 0');
   ok(Store.data.vault.alipay === 60, '新账户（支付宝）扣除 40 后为 60');
   ok(Store.data.vault.bank === 50, '无关账户（银行）不受影响');
-  ok(Store.data.vault.wechat_lct === 0, '「零钱通」在改账户过程中不受影响');
+  ok(Store.data.vault.wechat_change === 0, '「零钱」在改账户过程中不受影响');
 });
 
 test('回归 收入不影响记账环只入金库', (w) => {
@@ -810,6 +918,116 @@ test('回归 月度上限与日均联动', (w) => {
   ok(true, '上限为 0 时渲染不崩溃');
 });
 
+test('连续补账保留日期并可回到今天', (w) => {
+  const { Store, state } = w.__app;
+  const RealDate = w.Date;
+  let now = new RealDate(2026, 4, 1, 12).getTime();
+  w.Date = class extends RealDate {
+    constructor(...args) { super(...(args.length ? args : [now])); }
+    static now() { return now; }
+  };
+  w.document.dispatchEvent(new w.Event('visibilitychange'));
+  const form = w.document.querySelector('#page-ledger .entry-form');
+  const date = form.querySelector('.f-date');
+  const amount = form.querySelector('.f-amount');
+  const hint = form.querySelector('[data-entry-date-hint]');
+  Store.data.transactions = [];
+  setVal(w, date, '2026-04-30');
+  ok(hint.textContent.includes('昨天'), '历史日期显示昨天提示');
+  amount.value = '10'; submit(w, form);
+  amount.value = '20'; submit(w, form);
+  ok(Store.data.transactions.length === 2 && Store.data.transactions.every((t) => t.date === '2026-04-30'), '连续两笔使用同一历史日期');
+  ok(date.value === '2026-04-30' && state.ledgerMonth === '2026-04', '跨月补账保留日期并切换账单月份');
+  click(w, w.document.querySelector('#page-ledger .tab[data-type="income"]'));
+  amount.value = '5'; submit(w, form);
+  ok(Store.data.transactions[2].date === '2026-04-30' && Store.data.transactions[2].type === 'income', '收入也保留补账日期');
+  now = new RealDate(2026, 4, 2, 1).getTime();
+  w.document.dispatchEvent(new w.Event('visibilitychange'));
+  ok(date.value === '2026-04-30' && hint.textContent.includes('2026-04-30'), '跨午夜后手选历史日期保持不变');
+  click(w, form.querySelector('[data-entry-today]'));
+  ok(date.value === '2026-05-02' && hint.hidden, '回到今天并隐藏历史日期提示');
+  now = new RealDate(2026, 4, 3, 1).getTime();
+  w.document.dispatchEvent(new w.Event('visibilitychange'));
+  ok(date.value === '2026-05-03', '默认今天在跨日后更新');
+  setVal(w, date, ''); amount.value = '1'; submit(w, form);
+  ok(Store.data.transactions[3].date === '2026-05-03', '空日期提交时使用今天');
+  w.Date = RealDate;
+});
+
+test('账单搜索：跨月份、分类和范围', (w) => {
+  const { Store, state } = w.__app;
+  Store.data.transactions = [
+    { id: 's1', type: 'expense', amount: 30, category: '购物', account: 'wechat', remark: '蓝牙耳机', date: '2026-04-02', createdAt: 1 },
+    { id: 's2', type: 'expense', amount: 15, category: '娱乐', account: 'wechat', remark: '耳机', date: '2026-05-02', createdAt: 2 },
+    { id: 's3', type: 'income', amount: 50, category: '', account: 'bank', remark: '耳机退款', date: '2026-03-02', createdAt: 3 },
+    { id: 's4', type: 'expense', amount: 8, category: '餐饮', account: 'wechat', remark: '', date: '2026-04-03', createdAt: 4 },
+  ];
+  state.ledgerMonth = '2026-04';
+  w.__app.renderLedger();
+  ok(w.document.querySelectorAll('#billList .bill-item').length === 2, '未筛选时仍显示所选月份');
+  setVal(w, w.document.querySelector('#billSearch'), '耳机');
+  let items = w.document.querySelectorAll('#billList .bill-item');
+  ok(items.length === 3 && items[0].dataset.id === 's2' && items[2].dataset.id === 's3', '默认跨月搜索备注，包含收入并按日期排序');
+  ok(w.document.querySelector('#listSummary').textContent.includes('筛选结果') && w.document.querySelector('#listSummary').textContent.includes('¥45.00'), '汇总标明筛选结果且金额正确');
+  setVal(w, w.document.querySelector('#billCategoryFilter'), '购物');
+  ok(w.document.querySelectorAll('#billList .bill-item').length === 1 && w.document.querySelector('#billList .bill-item').dataset.id === 's1', '关键词与分类叠加');
+  setVal(w, w.document.querySelector('#billCategoryFilter'), '');
+  setVal(w, w.document.querySelector('#billSearchScope'), 'month');
+  ok(w.document.querySelectorAll('#billList .bill-item').length === 1, '可限制搜索到所选月份');
+  setVal(w, w.document.querySelector('#billSearch'), '没有此项');
+  ok(w.document.querySelector('#billList').textContent.includes('没有找到'), '无结果显示提示');
+  setVal(w, w.document.querySelector('#billSearch'), '');
+  setVal(w, w.document.querySelector('#billCategoryFilter'), '吃饭');
+  ok(w.document.querySelector('#billList .bill-item').dataset.id === 's4', '历史餐饮分类归入吃饭');
+  setVal(w, w.document.querySelector('#billCategoryFilter'), '');
+  ok(w.document.querySelectorAll('#billList .bill-item').length === 2, '清除条件恢复月度账单');
+});
+
+test('账单编辑：余额、跨月和保存失败', (w) => {
+  const { Store, state } = w.__app;
+  Store.data.vault = { wechat_change: 100, wechat_lct: 50, alipay: 100, bank: 100 };
+  Store.data.transactions = [
+    { id: 'edit-old', type: 'expense', amount: 20, category: '吃饭', meal: '午饭', account: 'wechat', remark: '午餐', date: '2026-04-01', counted: false, createdAt: 10 },
+    { id: 'edit-income', type: 'income', amount: 30, category: '', account: 'bank', remark: '', date: '2026-04-02', createdAt: 11 },
+  ];
+  state.ledgerMonth = '2026-04';
+  w.__app.renderLedger();
+  const edit = (id) => click(w, w.document.querySelector(`[data-id="${id}"] [data-act="edit"]`));
+  edit('edit-old');
+  ok(w.document.querySelector('#editTxMeal').value === '午饭', '编辑表单回填餐次');
+  w.document.querySelector('#editTxRemark').value = '修改备注';
+  click(w, w.document.querySelector('#modalOk'));
+  ok(Store.data.vault.wechat_change === 100 && Store.data.vault.wechat_lct === 50, '仅修改备注不改变历史微信余额');
+  ok(Store.data.transactions[0].counted === false && Store.data.transactions[0].createdAt === 10 && !('vaultKey' in Store.data.transactions[0]), '保留计入状态、时间和历史账户');
+  edit('edit-old');
+  w.document.querySelector('#editTxAmount').value = '25';
+  click(w, w.document.querySelector('#modalOk'));
+  ok(Store.data.vault.wechat_change === 95 && Store.data.vault.wechat_lct === 50, '历史微信账单修改金额仍使用零钱账户');
+  edit('edit-old');
+  w.document.querySelector('#editTxAmount').value = '35';
+  w.document.querySelector('#editTxAccount').value = 'alipay';
+  w.document.querySelector('#editTxDate').value = '2026-05-02';
+  click(w, w.document.querySelector('#modalOk'));
+  ok(Store.data.vault.wechat_change === 120 && Store.data.vault.alipay === 65, '支出变更时回滚原账户并扣除新账户');
+  ok(state.ledgerMonth === '2026-05' && Store.data.transactions[0].vaultKey === 'alipay', '跨月后跳转并保存新账户');
+  state.ledgerMonth = '2026-04'; w.__app.renderLedger();
+  edit('edit-income');
+  w.document.querySelector('#editTxAmount').value = '40';
+  w.document.querySelector('#editTxAccount').value = 'wechat';
+  click(w, w.document.querySelector('#modalOk'));
+  ok(Store.data.vault.bank === 70 && Store.data.vault.wechat_lct === 90, '收入变更时回滚原入账并存入新账户');
+  edit('edit-income');
+  const before = JSON.stringify(Store.data);
+  w.document.querySelector('#editTxAmount').value = '88';
+  const oldSet = w.Storage.prototype.setItem;
+  w.Storage.prototype.setItem = function () { throw new Error('test failure'); };
+  click(w, w.document.querySelector('#modalOk'));
+  w.Storage.prototype.setItem = oldSet;
+  ok(JSON.stringify(Store.data) === before && w.document.querySelector('#editTxAmount'), '保存失败保留原数据和编辑表单');
+  click(w, w.document.querySelector('#modalCancel'));
+  ok(JSON.stringify(Store.data) === before, '取消编辑不改变数据');
+});
+
 /* ---------- 需求 9：月度总结 ---------- */
 test('需求9 月度总结：12月网格 + 明细 + 环比 + 全年对比', (w) => {
   const { Store, state } = w.__app;
@@ -872,6 +1090,77 @@ test('需求9 月度总结：12月网格 + 明细 + 环比 + 全年对比', (w) 
   w.__app.renderMonthlySummary();
   const panelText2 = w.document.querySelector('#msumPanel').textContent;
   ok(panelText2.includes('¥350.00'), '含不计入的支出后 4 月合计 = ¥350.00（口径为全部支出）');
+});
+
+test('月度总结按分类查看账单', (w) => {
+  const { Store, state } = w.__app;
+  Store.data.transactions = [
+    { id: 'shop1', type: 'expense', amount: 30, category: '购物', account: 'wechat', remark: '买书', date: '2026-04-03', createdAt: 1 },
+    { id: 'shop2', type: 'expense', amount: 20, category: '购物', account: 'bank', remark: '', date: '2026-04-10', counted: false, createdAt: 2 },
+    { id: 'old', type: 'expense', amount: 12, category: '餐饮', account: 'wechat', remark: '午餐', date: '2026-04-04', createdAt: 3 },
+    { id: 'othermonth', type: 'expense', amount: 99, category: '购物', account: 'wechat', date: '2026-05-01', createdAt: 4 },
+    { id: 'income', type: 'income', amount: 999, category: '购物', account: 'wechat', date: '2026-04-05', createdAt: 5 },
+  ];
+  w.__app.switchPage('stats');
+  state.summaryYear = 2026;
+  state.summaryMonth = '2026-04';
+  w.__app.renderMonthlySummary();
+  const button = (cat) => w.document.querySelector(`[data-summary-category="${cat}"]`);
+  click(w, button('购物'));
+  let details = w.document.querySelector('#msumCategoryBills');
+  let bills = details.querySelectorAll('.bill-item');
+  ok(button('购物').getAttribute('aria-expanded') === 'true', '分类按钮显示展开状态');
+  ok(bills.length === 2 && details.textContent.includes('¥50.00') && details.textContent.includes('2 笔'), '仅显示当月购物支出及合计');
+  ok(bills[0].dataset.id === 'shop2' && bills[1].dataset.id === 'shop1', '账单按日期从近到远排列');
+  ok(details.textContent.includes('买书') && details.textContent.includes('不计入'), '显示备注与不计入标记');
+  ok(!bills[0].querySelector('.bill-remark') && !details.querySelector('.bill-actions'), '无备注正常显示且明细不可修改');
+  click(w, button('吃饭'));
+  details = w.document.querySelector('#msumCategoryBills');
+  ok(details.querySelectorAll('.bill-item').length === 1 && details.textContent.includes('午餐'), '切换分类并将历史餐饮归入吃饭');
+  click(w, button('吃饭'));
+  ok(w.document.querySelector('#msumCategoryBills').hidden, '再次点击收起明细');
+  click(w, button('购物'));
+  click(w, w.document.querySelector('#msumGrid [data-month="2026-05"]'));
+  ok(state.summaryCategory === null && w.document.querySelector('#msumCategoryBills').hidden, '切换月份收起明细');
+  click(w, button('购物'));
+  click(w, w.document.querySelector('#msumNextYear'));
+  ok(state.summaryCategory === null && w.document.querySelector('#msumPanel').textContent.includes('暂无支出'), '切换年份收起明细并显示空月份');
+});
+
+test('月度环比只在月份结束后显示', (w) => {
+  const { Store, state } = w.__app;
+  const RealDate = w.Date;
+  let now = new RealDate(2026, 11, 31, 23, 59, 0).getTime();
+  w.Date = class extends RealDate {
+    constructor(...args) { super(...(args.length ? args : [now])); }
+    static now() { return now; }
+  };
+  w.document.dispatchEvent(new w.Event('visibilitychange'));
+  Store.data.transactions = [
+    { id: 'nov', type: 'expense', amount: 20, category: '购物', account: 'wechat', date: '2026-11-10', createdAt: 1 },
+    { id: 'dec', type: 'expense', amount: 30, category: '购物', account: 'wechat', date: '2026-12-10', createdAt: 2 },
+    { id: 'new', type: 'expense', amount: 5, category: '娱乐', account: 'wechat', date: '2026-12-11', createdAt: 3 },
+  ];
+  w.__app.switchPage('stats');
+  state.summaryYear = 2026;
+  state.summaryMonth = '2026-12';
+  w.__app.renderMonthlySummary();
+  const panel = () => w.document.querySelector('#msumPanel');
+  ok(panel().textContent.includes('月结束后显示环比') && !panel().querySelector('.msum-delta'), '月末当天隐藏总额及分类环比');
+  click(w, w.document.querySelector('[data-summary-category="购物"]'));
+  ok(panel().textContent.includes('¥30.00') && panel().querySelectorAll('.bill-item').length === 1, '未结束月份保留金额与分类账单');
+  now = new RealDate(2027, 0, 1, 0, 0, 0).getTime();
+  w.document.dispatchEvent(new w.Event('visibilitychange'));
+  ok(panel().textContent.includes('对比 2026-11') && panel().textContent.includes('50.0%'), '跨年后返回页面自动显示上一月环比');
+  ok(panel().textContent.includes('新增') && panel().querySelectorAll('.bill-item').length === 1, '新增分类显示环比且展开状态保留');
+  state.summaryYear = 2027;
+  state.summaryMonth = '2027-01';
+  w.__app.renderMonthlySummary();
+  ok(panel().textContent.includes('暂无支出') && panel().textContent.includes('月结束后显示环比'), '空的当月提示月结束后显示');
+  state.summaryMonth = '2027-02';
+  w.__app.renderMonthlySummary();
+  ok(!panel().querySelector('.msum-delta'), '未来月份不显示环比');
+  w.Date = RealDate;
 });
 
 test('需求9 月份算术跨年正确', (w) => {
@@ -1484,10 +1773,10 @@ test('观影F 观影页含搜索 / 排序 / 添加 / 统计 / 筛选 / 区块容
     .forEach((id) => ok(!!page.querySelector('#' + id), `存在 #${id}`));
 });
 
-test('观影F 观影页外链指向 iioo.me 且新窗口打开', (w) => {
+test('观影F 观影页外链指向 libvio.app 且新窗口打开', (w) => {
   const a = w.document.querySelector('#showsLink');
   ok(!!a, '存在 #showsLink');
-  ok(a.getAttribute('href') === 'https://iioo.me/', 'href 指向 https://iioo.me/');
+  ok(a.getAttribute('href') === 'https://www.libvio.app/', 'href 指向 https://www.libvio.app/');
   ok(a.target === '_blank', '新窗口打开（target=_blank）');
   ok(/noopener/.test(a.getAttribute('rel') || ''), 'rel 含 noopener（防逆向引用）');
   ok(a.textContent.includes('点此去看剧'), '文案为「点此去看剧」');
