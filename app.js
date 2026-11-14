@@ -26,26 +26,26 @@ const CATEGORY_ICON = {
 
 /* 分类色板：低饱和、与设计系统一致 */
 const CATEGORY_COLOR = {
-  吃饭: '#17a073',
-  奶茶: '#c76a9a',
-  宵夜: '#d0803c',
-  宿舍: '#7b6bc4',
-  交通: '#4a7fc1',
-  购物: '#c99a2e',
-  娱乐: '#a3679f',
-  其它: '#8798a0',
+  吃饭: '#34d6a0',
+  奶茶: '#e890b6',
+  宵夜: '#f0a35e',
+  宿舍: '#a997f0',
+  交通: '#6fb0ff',
+  购物: '#e8c25a',
+  娱乐: '#d38fd6',
+  其它: '#9fb0a8',
 };
 
 /* 每个分类色对应的浅色底（图标 chip 背景） */
 const CATEGORY_TINT = {
-  吃饭: '#e6f5ef',
-  奶茶: '#f8ecf3',
-  宵夜: '#fbeee2',
-  宿舍: '#efedf9',
-  交通: '#e8f0f9',
-  购物: '#f9f2e0',
-  娱乐: '#f4ecf3',
-  其它: '#eef1f1',
+  吃饭: 'rgba(52,214,160,0.16)',
+  奶茶: 'rgba(232,144,182,0.16)',
+  宵夜: 'rgba(240,163,94,0.16)',
+  宿舍: 'rgba(169,151,240,0.16)',
+  交通: 'rgba(111,176,255,0.16)',
+  购物: 'rgba(232,194,90,0.16)',
+  娱乐: 'rgba(211,143,214,0.16)',
+  其它: 'rgba(159,176,168,0.16)',
 };
 
 /* 历史数据兼容：旧「餐饮」统一归入「吃饭」 */
@@ -205,8 +205,8 @@ function refreshIcons(root) {
 function catChip(cat, size) {
   const name = normalizeCategory(cat);
   const ic = CATEGORY_ICON[name] || 'package';
-  const fg = CATEGORY_COLOR[name] || '#8798a0';
-  const bg = CATEGORY_TINT[name] || '#eef1f1';
+  const fg = CATEGORY_COLOR[name] || '#9fb0a8';
+  const bg = CATEGORY_TINT[name] || 'rgba(159,176,168,0.16)';
   return `<span class="cat-chip${size === 'lg' ? ' cat-lg' : ''}" style="--chip-bg:${bg};--chip-fg:${fg}">${icon(ic)}</span>`;
 }
 
@@ -3218,7 +3218,7 @@ function renderStats() {
   const R = 78, C = 2 * Math.PI * R;
 
   if (!entries.length) {
-    svg.innerHTML = `<circle cx="110" cy="110" r="${R}" stroke="#eef2f5" stroke-width="26"></circle>`;
+    svg.innerHTML = `<circle cx="110" cy="110" r="${R}" stroke="#212b25" stroke-width="26"></circle>`;
     legend.innerHTML = `
       <li class="empty" style="padding:0">
         <span class="empty-icon">${icon('chart-pie')}</span>
@@ -3230,7 +3230,7 @@ function renderStats() {
     const arcs = entries.map(([cat, amt]) => {
       const frac = amt / total;
       const len = C * frac;
-      const color = CATEGORY_COLOR[cat] || '#8798a0';
+      const color = CATEGORY_COLOR[cat] || '#9fb0a8';
       const el = `<circle class="donut-seg" cx="110" cy="110" r="${R}"
           stroke="${color}" stroke-width="26"
           stroke-dasharray="${len} ${C - len}"
@@ -3238,11 +3238,11 @@ function renderStats() {
       offset += len;
       return el;
     }).join('');
-    svg.innerHTML = `<circle cx="110" cy="110" r="${R}" stroke="#f1f4f6" stroke-width="26"></circle>${arcs}`;
+    svg.innerHTML = `<circle cx="110" cy="110" r="${R}" stroke="#232e28" stroke-width="26"></circle>${arcs}`;
 
     legend.innerHTML = entries.map(([cat, amt]) => {
       const frac = amt / total;
-      const color = CATEGORY_COLOR[cat] || '#8798a0';
+      const color = CATEGORY_COLOR[cat] || '#9fb0a8';
       return `
         <li class="legend-item">
           <span class="legend-dot" style="background:${color}"></span>
@@ -3428,7 +3428,7 @@ function renderMonthlySummary() {
     const max = rows.length ? rows[0].amt : 1;
 
     const body = rows.map((r) => {
-      const color = CATEGORY_COLOR[r.cat] || '#8798a0';
+      const color = CATEGORY_COLOR[r.cat] || '#9fb0a8';
       return `
         <li><button type="button" class="rank-item msum-row" data-summary-category="${escapeHtml(r.cat)}"
           aria-expanded="${state.summaryCategory === r.cat}" aria-controls="msumCategoryBills">
